@@ -1,6 +1,6 @@
 # GeoFS Better Crashes
 
-A userscript for [GeoFS](https://www.geo-fs.com/) that makes crashing actually feel like something happened. When your aircraft goes down, you get a screen flash, an expanding shockwave ring, flying debris, camera shake, and more—all customizable.
+A userscript for [GeoFS](https://www.geo-fs.com/) that makes crashing actually feel like something happened. When your aircraft goes down, you get a screen flash, an expanding shockwave ring, flying debris, camera shake, and more—all customizable. OPEN DASHBOARD WITH ALT+N
 
 ## Features
 
