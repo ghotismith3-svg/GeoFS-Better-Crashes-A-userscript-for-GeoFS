@@ -8,7 +8,7 @@
 // @match        https://geo-fs.com/geofs.php*
 // @match        https://*.geo-fs.com/geofs.php*
 // @grant        none
-// @license      CC0-1.0
+// @license      CC0-4.0
 // ==/UserScript==
 
 (function () {
