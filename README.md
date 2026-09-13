@@ -47,7 +47,8 @@ The in-game settings panel lets you adjust:
 
 ## License
 
-[CC0 1.0 Universal](LICENSE) — Public Domain. Do whatever you want with this — use it, modify it, redistribute it, no attribution required. Credit is appreciated but never necessary.
+License
+CC BY 4.0 — see LICENSE. Use it, fork it, build on it — just credit the source.
 
 ## Credits
 
