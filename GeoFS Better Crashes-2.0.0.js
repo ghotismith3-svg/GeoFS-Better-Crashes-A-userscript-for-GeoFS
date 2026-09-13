@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         GeoFS Better Crashes
 // @namespace    https://github.com/
-// @version      2.0.0
-// @description  Visual explosion + loud sound + exaggerated shake on crash in GeoFS. Includes a "Realistic" mode (hard cut to black) and a settings panel (Alt+N) with sliders and reset.
+// @version      2.2.0
+// @description  Visual explosion + loud sound + exaggerated shake on crash in GeoFS. Includes a "Realistic" mode (hard cut to black + hidden native crash text) and a settings panel (Alt+N) with sliders and reset.
 // @author       You
 // @match        https://www.geo-fs.com/geofs.php*
 // @match        https://geo-fs.com/geofs.php*
 // @match        https://*.geo-fs.com/geofs.php*
 // @grant        none
-// @license      CC0-4.0
+// @license      CC0-1.0
 // ==/UserScript==
 
 (function () {
@@ -22,13 +22,43 @@
         realisticCutMs: 235,
         realisticFlashMs: 24,
         defaultFlashMs: 60,
-        explosionVolume: 9,
+        explosionVolume: 3,
         shakeIntensity: 45, // max px offset; rotation scales alongside this
         fireTintDurationMs: 6000,
         debrisCount: 70
     });
 
     const SETTINGS = { ...DEFAULTS };
+
+    // ============================================================
+    // PERSISTENCE (localStorage) — settings survive page reloads
+    // ============================================================
+    const STORAGE_KEY = "geofs-better-crashes-settings";
+
+    function loadSettings() {
+        try {
+            const raw = localStorage.getItem(STORAGE_KEY);
+            if (!raw) return;
+            const saved = JSON.parse(raw);
+            // Only copy over keys we actually know about, so old/corrupt
+            // saved data can't inject unexpected properties.
+            Object.keys(DEFAULTS).forEach((key) => {
+                if (key in saved) SETTINGS[key] = saved[key];
+            });
+        } catch (e) {
+            console.warn("💥 [Better Crashes] Failed to load saved settings:", e);
+        }
+    }
+
+    function saveSettings() {
+        try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(SETTINGS));
+        } catch (e) {
+            console.warn("💥 [Better Crashes] Failed to save settings:", e);
+        }
+    }
+
+    loadSettings(); // apply any saved values immediately, before anything below uses SETTINGS
 
     // fixed ratio between offset (px) and rotation (degrees) from the original shake: 3.5/45
     const SHAKE_ROTATE_RATIO = 3.5 / 45;
@@ -59,12 +89,25 @@
     compressor.release.value = 0.25;
 
     const makeupGain = audioCtx.createGain();
-    makeupGain.gain.value = 2.2;
+    makeupGain.gain.value = 1.3; // reduced from 2.2 — was stacking too much extra volume on top of the slider
 
     const speedGain = audioCtx.createGain();
     speedGain.gain.value = 1;
 
-    compressor.connect(makeupGain).connect(speedGain).connect(audioCtx.destination);
+    // Final safety limiter: caps the absolute loudest the explosion can ever
+    // get, no matter how high the volume slider or crash speed multiplier go.
+    const finalLimiter = audioCtx.createDynamicsCompressor();
+    finalLimiter.threshold.value = -6;
+    finalLimiter.knee.value = 0;
+    finalLimiter.ratio.value = 20; // near-brickwall limiting
+    finalLimiter.attack.value = 0.001;
+    finalLimiter.release.value = 0.1;
+
+    // Tag this node so the separate "GeoFS Volume Boost" script (if installed)
+    // knows to skip it and NOT apply the cockpit-view boost to explosion sound.
+    finalLimiter.__bcNoBoost = true;
+
+    compressor.connect(makeupGain).connect(speedGain).connect(finalLimiter).connect(audioCtx.destination);
 
     const explosionAudio = new Audio(EXPLOSION_MP3_URL);
     explosionAudio.crossOrigin = "anonymous";
@@ -331,6 +374,25 @@
     }
 
     // ============================================================
+    // HIDE NATIVE "YOU CRASHED" OVERLAY (Realistic mode only)
+    // Invisible but still clickable (so "click to reset" still works)
+    // ============================================================
+    const nativeCrashOverlayStyle = document.createElement("style");
+    nativeCrashOverlayStyle.id = "bc-hide-native-crash-overlay";
+    nativeCrashOverlayStyle.textContent = `
+        html.bc-realistic-mode .geofs-crashOverlay.geofs-crashed {
+            opacity: 0 !important;
+            color: transparent !important;
+        }
+    `;
+    document.head.appendChild(nativeCrashOverlayStyle);
+
+    function syncRealisticModeClass() {
+        document.documentElement.classList.toggle("bc-realistic-mode", SETTINGS.mode === "realistic");
+    }
+    syncRealisticModeClass(); // set initial state on load
+
+    // ============================================================
     // CAMERA SHAKE
     // ============================================================
     let shakeIntervalId = null;
@@ -404,7 +466,7 @@
     }
 
     // ============================================================
-    // SETTINGS PANEL (v2.0.0)
+    // SETTINGS PANEL (v2.1.0)
     // ============================================================
     let panel = null;
     let panelPos = null; // {left, top} after first drag
@@ -552,7 +614,7 @@
 
                 <div class="bc-section-title">Audio</div>
                 <label>Explosion volume <span class="bc-val" id="bc-vol-val">${SETTINGS.explosionVolume}</span></label>
-                <input type="range" id="bc-vol" min="0" max="20" step="0.5" value="${SETTINGS.explosionVolume}">
+                <input type="range" id="bc-vol" min="0" max="10" step="0.5" value="${SETTINGS.explosionVolume}">
 
                 <button class="bc-reset-btn" id="bc-reset-btn">↺ Restore defaults</button>
             </div>
@@ -570,44 +632,55 @@
 
         modeBtn.onclick = function () {
             SETTINGS.mode = SETTINGS.mode === "realistic" ? "default" : "realistic";
+            syncRealisticModeClass();
             statusEl.textContent = `Current mode: ${modeLabel()}`;
             modeBtn.textContent = `Switch to ${SETTINGS.mode === "realistic" ? "Default" : "Realistic"}`;
+            saveSettings();
             console.log(`💥 [Better Crashes] Mode changed to: ${SETTINGS.mode}`);
         };
 
         panel.querySelector("#bc-dflash").oninput = function () {
             SETTINGS.defaultFlashMs = parseFloat(this.value);
             panel.querySelector("#bc-dflash-val").textContent = this.value;
+            saveSettings();
         };
         panel.querySelector("#bc-rflash").oninput = function () {
             SETTINGS.realisticFlashMs = parseFloat(this.value);
             panel.querySelector("#bc-rflash-val").textContent = this.value;
+            saveSettings();
         };
         panel.querySelector("#bc-shake").oninput = function () {
             SETTINGS.shakeIntensity = parseFloat(this.value);
             panel.querySelector("#bc-shake-val").textContent = this.value;
+            saveSettings();
         };
         panel.querySelector("#bc-debris").oninput = function () {
             SETTINGS.debrisCount = parseFloat(this.value);
             panel.querySelector("#bc-debris-val").textContent = this.value;
+            saveSettings();
         };
         panel.querySelector("#bc-tint").oninput = function () {
             SETTINGS.fireTintDurationMs = parseFloat(this.value) * 1000;
             panel.querySelector("#bc-tint-val").textContent = this.value;
+            saveSettings();
         };
         panel.querySelector("#bc-cut").oninput = function () {
             SETTINGS.realisticCutMs = parseFloat(this.value);
             panel.querySelector("#bc-cut-val").textContent = this.value;
+            saveSettings();
         };
         panel.querySelector("#bc-vol").oninput = function () {
             SETTINGS.explosionVolume = parseFloat(this.value);
             explosionGain.gain.value = SETTINGS.explosionVolume;
             panel.querySelector("#bc-vol-val").textContent = this.value;
+            saveSettings();
         };
 
         panel.querySelector("#bc-reset-btn").onclick = function () {
             Object.assign(SETTINGS, DEFAULTS);
             explosionGain.gain.value = SETTINGS.explosionVolume;
+            syncRealisticModeClass();
+            saveSettings(); // persist the reset-to-defaults too, so a reload doesn't bring old values back
             console.log("↺ [Better Crashes] Values restored to defaults.");
             panel.remove();
             panel = null;
