@@ -536,6 +536,22 @@
     function showPanel() {
         if (panel) { panel.remove(); panel = null; return; }
 
+        // DEFENSIVE FIX (reported: "toggle does absolutely nothing" even
+        // after the keybind conflict was fixed). #bc-panel uses
+        // position:fixed, which normally positions relative to the
+        // viewport -- but if ANY ancestor has a non-"none" CSS transform,
+        // fixed descendants position relative to THAT ancestor instead.
+        // This exact script sets document.body.style.transform during
+        // triggerCameraShake(), and clears it when the shake completes --
+        // but if that ever gets left in a bad state (stale value, a shake
+        // that didn't fully finish, fullscreen toggled mid-shake), the
+        // panel can still be created and appended with zero errors while
+        // rendering completely off-screen, which looks identical to "the
+        // toggle does nothing" from the outside. Clearing it here, right
+        // before the panel is built, costs nothing and removes this as a
+        // possible cause outright.
+        document.body.style.transform = "";
+
         buildPanelStyles();
 
         panel = document.createElement("div");
@@ -581,6 +597,19 @@
             </div>
         `;
         document.body.appendChild(panel);
+
+        // DIAGNOSTIC: confirms whether the panel actually made it into
+        // the DOM and exactly where it thinks it's rendering. If the
+        // element exists but width/height/top/left come back as 0 or
+        // wildly off-viewport, that's hard proof it's a positioning bug
+        // and not a "listener never fired" bug -- paste this line if the
+        // panel is still invisible after this fix.
+        const rect = panel.getBoundingClientRect();
+        console.log(
+            `💥 [Better Crashes] Panel opened -- rect: left=${rect.left.toFixed(0)} top=${rect.top.toFixed(0)} ` +
+            `width=${rect.width.toFixed(0)} height=${rect.height.toFixed(0)} | ` +
+            `body transform at open: "${getComputedStyle(document.body).transform}"`
+        );
 
         if (panelPos) {
             panel.style.transform = "none";
@@ -654,6 +683,14 @@
             const tag = document.activeElement?.tagName;
             if (e.key === "Escape" && panel) { panel.remove(); panel = null; return; }
             if (e.altKey && e.key.toLowerCase() === "u" && !e.ctrlKey && !e.shiftKey && !["INPUT", "TEXTAREA"].includes(tag)) {
+                // DIAGNOSTIC: confirms the listener itself is firing and
+                // seeing the combo, BEFORE anything about panel
+                // positioning matters. If this line never appears in the
+                // console when Alt+U is pressed, the bug isn't the panel
+                // at all -- something upstream (another script, a GeoFS
+                // handler, focus being stuck in an unexpected element) is
+                // intercepting the keydown before it gets here.
+                console.log("💥 [Better Crashes] Alt+U detected, calling showPanel(). document.activeElement:", document.activeElement);
                 e.preventDefault();
                 e.stopPropagation();
                 showPanel();
