@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GeoFS Better Crashes
 // @namespace    https://github.com/
-// @version      2.1.0
-// @description  Visual explosion + loud sound + exaggerated shake on crash in GeoFS. Includes a "Realistic" mode (hard cut to black + hidden native crash text) and a settings panel (Alt+N) with sliders and reset.
+// @version      2.1.1
+// @description  Visual explosion + loud sound + exaggerated shake on crash in GeoFS. Includes a "Realistic" mode (hard cut to black + hidden native crash text) and a settings panel (Alt+U) with sliders and reset.
 // @author       You
 // @match        https://www.geo-fs.com/geofs.php*
 // @match        https://geo-fs.com/geofs.php*
@@ -427,7 +427,7 @@
     }
 
     // ============================================================
-    // SETTINGS PANEL (v2.1.0)
+    // SETTINGS PANEL
     // ============================================================
     let panel = null;
     let panelPos = null; // {left, top} after first drag
@@ -647,12 +647,13 @@
         attachDragHandlers(panel.querySelector("#bc-panel-header"));
     }
 
+    // CHANGED: toggle shortcut is now Alt+U (was Alt+N).
     document.addEventListener(
         "keydown",
         (e) => {
             const tag = document.activeElement?.tagName;
             if (e.key === "Escape" && panel) { panel.remove(); panel = null; return; }
-            if (e.altKey && e.key.toLowerCase() === "n" && !e.ctrlKey && !e.shiftKey && !["INPUT", "TEXTAREA"].includes(tag)) {
+            if (e.altKey && e.key.toLowerCase() === "u" && !e.ctrlKey && !e.shiftKey && !["INPUT", "TEXTAREA"].includes(tag)) {
                 e.preventDefault();
                 e.stopPropagation();
                 showPanel();
