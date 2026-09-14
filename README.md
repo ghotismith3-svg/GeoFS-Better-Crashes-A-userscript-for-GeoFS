@@ -1,6 +1,6 @@
 # GeoFS Better Crashes
 
-A userscript for [GeoFS](https://www.geo-fs.com/) that makes crashing actually feel like something happened. When your aircraft goes down, you get a screen flash, an expanding shockwave ring, flying debris, camera shake, and more—all customizable. OPEN DASHBOARD WITH ALT+N
+A userscript for [GeoFS](https://www.geo-fs.com/) that makes crashing actually feel like something happened. When your aircraft goes down, you get a screen flash, an expanding shockwave ring, flying debris, camera shake, and more—all customizable. OPEN DASHBOARD WITH ALT+U
 
 ## Features
 
@@ -8,7 +8,7 @@ A userscript for [GeoFS](https://www.geo-fs.com/) that makes crashing actually f
   - **Default** — flash, shockwave, debris, camera shake, and a lingering fire tint over the screen.
   - **Realistic** — everything hits at once, then cuts hard to black and mutes all page audio, simulating a real loss-of-consciousness moment.
 - **Speed-scaled explosion volume** — a slow ground scrape sounds a lot different than slamming in at 300 knots.
-- **In-game settings panel** (press `Alt+N`) with sliders for flash duration, shake intensity, debris count, fire tint duration, cut-to-black timing, and explosion volume — plus a one-click reset.
+- **In-game settings panel** (press `Alt+U`) with sliders for flash duration, shake intensity, debris count, fire tint duration, cut-to-black timing, and explosion volume — plus a one-click reset.
 - Draggable panel, closes with `Esc` or the `✕` button.
 - No dependencies, no external frameworks — pure vanilla JavaScript.
 
@@ -31,7 +31,7 @@ A userscript for [GeoFS](https://www.geo-fs.com/) that makes crashing actually f
 ## Usage
 
 - The explosion effects trigger **automatically** whenever GeoFS registers a crash.
-- Press **`Alt+N`** in-game to open the settings panel and tweak the experience to your liking.
+- Press **`Alt+U`** in-game to open the settings panel and tweak the experience to your liking.
 - All settings persist across sessions.
 
 ## Customization
