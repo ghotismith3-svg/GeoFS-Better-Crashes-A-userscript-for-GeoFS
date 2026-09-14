@@ -1,762 +1,563 @@
 // ==UserScript==
-// @name         GeoFS Better Crashes
-// @namespace    https://github.com/
-// @version      2.2.0
-// @description  Visual explosion + loud sound + exaggerated shake on crash in GeoFS. Includes a "Realistic" mode (hard cut to black + hidden native crash text) and a settings panel (Alt+N) with sliders and reset.
-// @author       You
+// @name         GeoFS Real Impact — Precision Crash Detection
+// @namespace    https://www.geo-fs.com/geofs.php?v=4
+// @version      3.4.2
+// @description  Forces a real crash (engine cutout + forced loss of control) only when you actually hit a real detected obstacle -- a real tree or a real building at your exact position. Uses geofsRealTrees with cylinder collision support and terrain sampling for buildings. v3.4.2: Quiet & optimized console logging (clean crash banner, debugLogs toggle in panel/API) + universal altitude ceiling + Exit button.
+// @author       yasseristaken
 // @match        https://www.geo-fs.com/geofs.php*
 // @match        https://geo-fs.com/geofs.php*
 // @match        https://*.geo-fs.com/geofs.php*
 // @grant        none
-// @license      CC0-1.0
+// @run-at       document-idle
+// @license      CC-BY-4.0
 // ==/UserScript==
 
 (function () {
-    "use strict";
+  "use strict";
 
-    // ============================================================
-    // DEFAULT VALUES AND CURRENT SETTINGS
-    // ============================================================
-    const DEFAULTS = Object.freeze({
-        mode: "default", // "default" | "realistic"
-        realisticCutMs: 235,
-        realisticFlashMs: 24,
-        defaultFlashMs: 60,
-        explosionVolume: 3,
-        shakeIntensity: 45, // max px offset; rotation scales alongside this
-        fireTintDurationMs: 6000,
-        debrisCount: 70
-    });
+  // ============================================================
+  // 0. State & configuration
+  // ============================================================
+  let injected = false;
+  let panel = null;
+  let lastCrashTime = 0;
+  let spawnGraceUntil = 0;
+  let forceFallActive = false;
+  let forceFallElapsed = 0;
+  let controlsHooked = false;
+  let resetFlightHooked = false;
+  let lastCrashedState = false;
 
-    const SETTINGS = { ...DEFAULTS };
+  const DEFAULTS = Object.freeze({
+    enabled: true,
+    minAltitudeFt: 120, // Nudged from 80 -> 120ft to comfortably cover tall 30-35m tree canopies without cruise false alerts
+    buildingMaxAltitudeFt: 3300,
+    minSpeedKts: 15,
+    objectHeightThresholdM: 4,
+    buildingsEnabled: true,
+    treeRadiusM: 13.5,            // Horizontal radius for tree canopy/trunk collision
+    treeCanopyHeightM: 32,        // FIX v3.4: Vertical tree canopy height (meters) passed to Extractor v1.9.0
+    sampleOffsetM: 8,
+    buildingConfirmChecks: 2,
+    buildingVerticalMarginM: 2,
+    cooldownMs: 3000,
+    spawnGraceMs: 4000,
+    debugLogs: false              // Clean, quiet console by default
+  });
 
-    // ============================================================
-    // PERSISTENCE (localStorage) — settings survive page reloads
-    // ============================================================
-    const STORAGE_KEY = "geofs-better-crashes-settings";
+  const settings = { ...DEFAULTS };
 
-    function loadSettings() {
-        try {
-            const raw = localStorage.getItem(STORAGE_KEY);
-            if (!raw) return;
-            const saved = JSON.parse(raw);
-            // Only copy over keys we actually know about, so old/corrupt
-            // saved data can't inject unexpected properties.
-            Object.keys(DEFAULTS).forEach((key) => {
-                if (key in saved) SETTINGS[key] = saved[key];
-            });
-        } catch (e) {
-            console.warn("💥 [Better Crashes] Failed to load saved settings:", e);
-        }
+  // ============================================================
+  // 0.1 PERSISTENCE (localStorage)
+  // ============================================================
+  const STORAGE_KEY = "geofs-real-impact-settings";
+
+  function loadSettings() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return;
+      const saved = JSON.parse(raw);
+      Object.keys(DEFAULTS).forEach((key) => {
+        if (key in saved) settings[key] = saved[key];
+      });
+    } catch (e) {
+      console.warn("[Real Impact] Failed to load saved settings:", e);
     }
+  }
 
-    function saveSettings() {
-        try {
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(SETTINGS));
-        } catch (e) {
-            console.warn("💥 [Better Crashes] Failed to save settings:", e);
-        }
+  function saveSettings() {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+    } catch (e) {
+      console.warn("[Real Impact] Failed to save settings:", e);
     }
+  }
 
-    loadSettings(); // apply any saved values immediately, before anything below uses SETTINGS
+  loadSettings();
 
-    // fixed ratio between offset (px) and rotation (degrees) from the original shake: 3.5/45
-    const SHAKE_ROTATE_RATIO = 3.5 / 45;
+  function getCesium() {
+    return window.Cesium || (window.geofs?.api?.Cesium) || null;
+  }
+  function getViewer() {
+    return (window.geofs?.api?.viewer) || null;
+  }
 
-    // ============================================================
-    // STATE
-    // ============================================================
-    let wasCrashed = false;
-    let audioUnlocked = false;
-    let lastSpeedKnots = 0;
-
-    const mutedMediaElements = new Map();
-    let pageAudioMuted = false;
-
-    // ============================================================
-    // AUDIO: EXPLOSION
-    // ============================================================
-    const EXPLOSION_MP3_URL =
-        "https://cdn.jsdelivr.net/gh/ghotismith3-svg/laexplosiondeimpacto@main/audiomass-output%20%281%29.mp3";
-
-    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-
-    const compressor = audioCtx.createDynamicsCompressor();
-    compressor.threshold.value = -8;
-    compressor.knee.value = 6;
-    compressor.ratio.value = 6;
-    compressor.attack.value = 0.003;
-    compressor.release.value = 0.25;
-
-    const makeupGain = audioCtx.createGain();
-    makeupGain.gain.value = 1.3; // reduced from 2.2 — was stacking too much extra volume on top of the slider
-
-    const speedGain = audioCtx.createGain();
-    speedGain.gain.value = 1;
-
-    // Final safety limiter: caps the absolute loudest the explosion can ever
-    // get, no matter how high the volume slider or crash speed multiplier go.
-    const finalLimiter = audioCtx.createDynamicsCompressor();
-    finalLimiter.threshold.value = -6;
-    finalLimiter.knee.value = 0;
-    finalLimiter.ratio.value = 20; // near-brickwall limiting
-    finalLimiter.attack.value = 0.001;
-    finalLimiter.release.value = 0.1;
-
-    // Tag this node so the separate "GeoFS Volume Boost" script (if installed)
-    // knows to skip it and NOT apply the cockpit-view boost to explosion sound.
-    finalLimiter.__bcNoBoost = true;
-
-    compressor.connect(makeupGain).connect(speedGain).connect(finalLimiter).connect(audioCtx.destination);
-
-    const explosionAudio = new Audio(EXPLOSION_MP3_URL);
-    explosionAudio.crossOrigin = "anonymous";
-    explosionAudio.preload = "auto";
-
-    const explosionGain = audioCtx.createGain();
-    explosionGain.gain.value = SETTINGS.explosionVolume;
-
-    const explosionSource = audioCtx.createMediaElementSource(explosionAudio);
-    explosionSource.connect(explosionGain).connect(compressor);
-
-    function playExplosionSound() {
-        const now = audioCtx.currentTime;
-
-        explosionAudio.currentTime = 0;
-        explosionAudio.play().catch((err) => console.warn("🔇 Explosion audio blocked:", err));
-
-        const sub = audioCtx.createOscillator();
-        const subGain = audioCtx.createGain();
-
-        sub.type = "triangle";
-        sub.frequency.setValueAtTime(70, now);
-        sub.frequency.exponentialRampToValueAtTime(24, now + 0.6);
-
-        subGain.gain.setValueAtTime(3.5, now);
-        subGain.gain.exponentialRampToValueAtTime(0.001, now + 0.9);
-
-        sub.connect(subGain).connect(compressor);
-        sub.start(now);
-        sub.stop(now + 0.9);
-    }
-
-    // ============================================================
-    // SCRIPT AUDIO / MUTING IN REALISTIC MODE
-    // ============================================================
-    function muteCrashAudio() {
-        try {
-            speedGain.gain.cancelScheduledValues(audioCtx.currentTime);
-            speedGain.gain.setValueAtTime(0, audioCtx.currentTime);
-        } catch (e) {}
-        try {
-            explosionAudio.pause();
-        } catch (e) {}
-    }
-
-    function restoreCrashAudio() {
-        try {
-            speedGain.gain.cancelScheduledValues(audioCtx.currentTime);
-            speedGain.gain.setValueAtTime(1, audioCtx.currentTime);
-        } catch (e) {}
-    }
-
-    function mutePageAudio() {
-        if (pageAudioMuted) return;
-        pageAudioMuted = true;
-        document.querySelectorAll("audio, video").forEach((el) => {
-            if (el === explosionAudio) return;
-            if (!mutedMediaElements.has(el)) {
-                mutedMediaElements.set(el, { muted: el.muted, volume: el.volume });
-            }
-            el.muted = true;
-        });
-    }
-
-    function restorePageAudio() {
-        pageAudioMuted = false;
-        mutedMediaElements.forEach((state, el) => {
-            try {
-                el.muted = state.muted;
-                el.volume = state.volume;
-            } catch (e) {}
-        });
-        mutedMediaElements.clear();
-        restoreCrashAudio();
-    }
-
-    const mediaObserver = new MutationObserver(() => {
-        if (!pageAudioMuted) return;
-        document.querySelectorAll("audio, video").forEach((el) => {
-            if (el === explosionAudio) return;
-            if (!mutedMediaElements.has(el)) {
-                mutedMediaElements.set(el, { muted: el.muted, volume: el.volume });
-            }
-            el.muted = true;
-        });
-    });
-    mediaObserver.observe(document.documentElement, { childList: true, subtree: true });
-
-    function unlockAudio() {
-        if (audioUnlocked) return;
-        audioCtx.resume();
-        explosionAudio
-            .play()
-            .then(() => {
-                explosionAudio.pause();
-                explosionAudio.currentTime = 0;
-            })
-            .catch(() => {});
-        audioUnlocked = true;
-        document.removeEventListener("click", unlockAudio);
-        document.removeEventListener("keydown", unlockAudio);
-    }
-    document.addEventListener("click", unlockAudio);
-    document.addEventListener("keydown", unlockAudio);
-
-    // ============================================================
-    // FLASH
-    // ============================================================
-    const flash = document.createElement("div");
-    flash.style.cssText = `
-        position:fixed; inset:0; z-index:999998;
-        background:#fff; opacity:0; pointer-events:none;
+  // ============================================================
+  // 1. Simple toast
+  // ============================================================
+  function showToast(text, isBad) {
+    const tip = document.createElement("div");
+    tip.style.cssText = `
+      position:fixed;top:20px;left:50%;transform:translateX(-50%);
+      background:${isBad ? "rgba(190,0,0,0.9)" : "rgba(0,140,0,0.85)"};
+      color:#fff;padding:10px 22px;border-radius:8px;z-index:99999;
+      font-size:14px;font-weight:600;box-shadow:0 2px 8px rgba(0,0,0,0.3);
+      transition:opacity 0.6s ease;
     `;
-    document.body.appendChild(flash);
+    tip.textContent = text;
+    document.body.appendChild(tip);
+    setTimeout(() => {
+      tip.style.opacity = "0";
+      setTimeout(() => tip.remove(), 600);
+    }, 2200);
+  }
 
-    function triggerFlash() {
-        const duration = SETTINGS.mode === "realistic" ? SETTINGS.realisticFlashMs : SETTINGS.defaultFlashMs;
-        flash.style.transition = "none";
-        flash.style.opacity = "0.95";
-        setTimeout(() => {
-            flash.style.transition = SETTINGS.mode === "realistic" ? "opacity 0.06s ease-out" : "opacity 1.1s ease-out";
-            flash.style.opacity = "0";
-        }, duration);
+  // ============================================================
+  // 2. Object detection: buildings (sampleHeight) + trees (geofsRealTrees)
+  // ============================================================
+  function offsetLatLon(lat, lon, headingDeg, offsetMeters) {
+    const Cesium = getCesium();
+    const R = 6378137;
+    const perpendicularRad = Cesium.Math.toRadians((headingDeg || 0) + 90);
+    const dLat = (offsetMeters * Math.cos(perpendicularRad)) / R;
+    const dLon =
+      (offsetMeters * Math.sin(perpendicularRad)) /
+      (R * Math.cos(Cesium.Math.toRadians(lat)));
+
+    return {
+      lat: lat + Cesium.Math.toDegrees(dLat),
+      lon: lon + Cesium.Math.toDegrees(dLon)
+    };
+  }
+
+  let fallbackWarned = false;
+
+  function sampleHeightAtAircraft(viewer, lat, lon, headingDeg) {
+    const Cesium = getCesium();
+    if (!Cesium || !viewer) return null;
+
+    const obj3d = window.geofs?.aircraft?.instance?.object3d;
+    const canHide = !!(obj3d && typeof obj3d.setVisibility === "function");
+
+    if (!canHide && !fallbackWarned) {
+      fallbackWarned = true;
+      console.warn("[Real Impact] object3d.setVisibility not available -- falling back to lateral-offset sampling.");
     }
 
-    // ============================================================
-    // SHOCKWAVE
-    // ============================================================
-    const activeRings = [];
-
-    function triggerShockwave() {
-        const ring = document.createElement("div");
-        ring.style.cssText = `
-            position:fixed; top:50%; left:50%; z-index:999997;
-            width:80px; height:80px; border-radius:50%;
-            border:10px solid rgba(255,140,0,0.9);
-            box-shadow:0 0 40px 10px rgba(255,80,0,0.6);
-            pointer-events:none;
-            transform:translate(-50%,-50%) scale(0);
-            opacity:1;
-            transition: transform 0.8s cubic-bezier(0.1,0.8,0.3,1), opacity 0.8s ease-out;
-        `;
-        document.body.appendChild(ring);
-        activeRings.push(ring);
-        requestAnimationFrame(() => {
-            ring.style.transform = "translate(-50%,-50%) scale(9)";
-            ring.style.opacity = "0";
-        });
-        setTimeout(() => {
-            ring.remove();
-            const idx = activeRings.indexOf(ring);
-            if (idx !== -1) activeRings.splice(idx, 1);
-        }, 850);
+    let sampleLat = lat, sampleLon = lon;
+    if (!canHide) {
+      const offset = offsetLatLon(lat, lon, headingDeg, settings.sampleOffsetM);
+      sampleLat = offset.lat;
+      sampleLon = offset.lon;
     }
 
-    // ============================================================
-    // PARTICLES
-    // ============================================================
-    const debrisCanvas = document.createElement("canvas");
-    debrisCanvas.style.cssText = `position:fixed; inset:0; z-index:999996; pointer-events:none;`;
-    document.body.appendChild(debrisCanvas);
-    const debrisCtx = debrisCanvas.getContext("2d");
-
-    function resizeCanvas() {
-        debrisCanvas.width = window.innerWidth;
-        debrisCanvas.height = window.innerHeight;
-    }
-    resizeCanvas();
-    window.addEventListener("resize", resizeCanvas);
-
-    let particles = [];
-    let particleLoopRunning = false;
-
-    function spawnDebris() {
-        const cx = window.innerWidth / 2;
-        const cy = window.innerHeight / 2;
-        const count = SETTINGS.debrisCount;
-        const colors = ["#ff8c00", "#ff4500", "#ffd700", "#8a8a8a", "#3a3a3a"];
-
-        for (let i = 0; i < count; i++) {
-            const angle = Math.random() * Math.PI * 2;
-            const speed = 4 + Math.random() * 14;
-            particles.push({
-                x: cx, y: cy,
-                vx: Math.cos(angle) * speed,
-                vy: Math.sin(angle) * speed - 4,
-                size: 2 + Math.random() * 6,
-                color: colors[Math.floor(Math.random() * colors.length)],
-                life: 1,
-                decay: 0.008 + Math.random() * 0.014,
-                gravity: 0.35 + Math.random() * 0.25
-            });
-        }
-        if (!particleLoopRunning) {
-            particleLoopRunning = true;
-            requestAnimationFrame(particleLoop);
-        }
-    }
-
-    function particleLoop() {
-        debrisCtx.clearRect(0, 0, debrisCanvas.width, debrisCanvas.height);
-        particles.forEach((p) => {
-            p.x += p.vx;
-            p.y += p.vy;
-            p.vy += p.gravity;
-            p.life -= p.decay;
-            debrisCtx.globalAlpha = Math.max(p.life, 0);
-            debrisCtx.fillStyle = p.color;
-            debrisCtx.fillRect(p.x, p.y, p.size, p.size);
-        });
-        particles = particles.filter((p) => p.life > 0);
-        debrisCtx.globalAlpha = 1;
-        if (particles.length > 0) {
-            requestAnimationFrame(particleLoop);
-        } else {
-            particleLoopRunning = false;
-            debrisCtx.clearRect(0, 0, debrisCanvas.width, debrisCanvas.height);
-        }
-    }
-
-    // ============================================================
-    // FIRE TINT
-    // ============================================================
-    const fireTint = document.createElement("div");
-    fireTint.style.cssText = `position:fixed; inset:0; z-index:999995; background:rgba(255,120,0,0); pointer-events:none;`;
-    document.body.appendChild(fireTint);
-
-    let fireTintIntervalId = null;
-    let fireTintSafetyTimeout = null;
-
-    function startFireTint() {
-        stopFireTint();
-        fireTint.style.transition = "none";
-        fireTintIntervalId = setInterval(() => {
-            const warm = Math.random();
-            const g = Math.floor(60 + warm * 140);
-            const alpha = 0.1 + Math.random() * 0.22;
-            fireTint.style.background = `rgba(255,${g},0,${alpha})`;
-        }, 90);
-        fireTintSafetyTimeout = setTimeout(stopFireTint, SETTINGS.fireTintDurationMs);
-    }
-
-    function stopFireTint() {
-        if (fireTintIntervalId) { clearInterval(fireTintIntervalId); fireTintIntervalId = null; }
-        if (fireTintSafetyTimeout) { clearTimeout(fireTintSafetyTimeout); fireTintSafetyTimeout = null; }
-        fireTint.style.transition = "background 0.6s ease-out";
-        fireTint.style.background = "rgba(255,120,0,0)";
-    }
-
-    // ============================================================
-    // BLACKOUT
-    // ============================================================
-    const blackout = document.createElement("div");
-    blackout.style.cssText = `position:fixed; inset:0; z-index:1000000; background:#000; opacity:0; pointer-events:none;`;
-    document.body.appendChild(blackout);
-
-    function showBlackout() {
-        blackout.style.transition = "opacity 0.06s ease-in";
-        blackout.style.opacity = "1";
-    }
-    function hideBlackout() {
-        blackout.style.transition = "opacity 0.8s ease-out";
-        blackout.style.opacity = "0";
-    }
-
-    // ============================================================
-    // HIDE NATIVE "YOU CRASHED" OVERLAY (Realistic mode only)
-    // Invisible but still clickable (so "click to reset" still works)
-    // ============================================================
-    const nativeCrashOverlayStyle = document.createElement("style");
-    nativeCrashOverlayStyle.id = "bc-hide-native-crash-overlay";
-    nativeCrashOverlayStyle.textContent = `
-        html.bc-realistic-mode .geofs-crashOverlay.geofs-crashed {
-            opacity: 0 !important;
-            color: transparent !important;
-        }
-    `;
-    document.head.appendChild(nativeCrashOverlayStyle);
-
-    function syncRealisticModeClass() {
-        document.documentElement.classList.toggle("bc-realistic-mode", SETTINGS.mode === "realistic");
-    }
-    syncRealisticModeClass(); // set initial state on load
-
-    // ============================================================
-    // CAMERA SHAKE
-    // ============================================================
-    let shakeIntervalId = null;
-    let shakeTarget = null;
-
-    function triggerCameraShake() {
-        const target = document.fullscreenElement || document.webkitFullscreenElement || document.body;
-        shakeTarget = target;
-
-        const totalFrames = 26;
-        let frame = 0;
-        const maxOffset = SETTINGS.shakeIntensity;
-        const maxRotate = SETTINGS.shakeIntensity * SHAKE_ROTATE_RATIO;
-
-        if (shakeIntervalId) clearInterval(shakeIntervalId);
-
-        shakeIntervalId = setInterval(() => {
-            frame++;
-            const decay = 1 - frame / totalFrames;
-            const x = (Math.random() - 0.5) * maxOffset * decay;
-            const y = (Math.random() - 0.5) * maxOffset * decay;
-            const r = (Math.random() - 0.5) * maxRotate * decay;
-            target.style.transform = `translate(${x}px,${y}px) rotate(${r}deg)`;
-            if (frame >= totalFrames) {
-                clearInterval(shakeIntervalId);
-                shakeIntervalId = null;
-                target.style.transform = "";
-            }
-        }, 35);
-    }
-
-    function stopCameraShakeNow() {
-        if (shakeIntervalId) { clearInterval(shakeIntervalId); shakeIntervalId = null; }
-        if (shakeTarget) shakeTarget.style.transform = "";
-    }
-
-    // ============================================================
-    // REALISTIC CUT
-    // ============================================================
-    function cutEffectsAndGoBlack() {
-        muteCrashAudio();
-        mutePageAudio();
-        flash.style.transition = "none";
-        flash.style.opacity = "0";
-        activeRings.forEach((r) => r.remove());
-        activeRings.length = 0;
-        particles = [];
-        debrisCtx.clearRect(0, 0, debrisCanvas.width, debrisCanvas.height);
-        stopCameraShakeNow();
-        stopFireTint();
-        showBlackout();
-    }
-
-    // ============================================================
-    // MAIN TRIGGER
-    // ============================================================
-    function triggerBetterCrash() {
-        triggerFlash();
-        triggerShockwave();
-        spawnDebris();
-        triggerCameraShake();
-        playExplosionSound();
-
-        console.log(`💥 [Better Crashes] Boom! (mode: ${SETTINGS.mode})`);
-
-        if (SETTINGS.mode === "realistic") {
-            setTimeout(cutEffectsAndGoBlack, SETTINGS.realisticCutMs);
-        } else {
-            startFireTint();
-        }
-    }
-
-    // ============================================================
-    // SETTINGS PANEL (v2.1.0)
-    // ============================================================
-    let panel = null;
-    let panelPos = null; // {left, top} after first drag
-    let isDragging = false;
-    let dragStartX = 0, dragStartY = 0, dragOriginLeft = 0, dragOriginTop = 0;
-
-    function buildPanelStyles() {
-        if (document.getElementById("bc-panel-style")) return;
-        const style = document.createElement("style");
-        style.id = "bc-panel-style";
-        style.textContent = `
-            #bc-panel {
-                position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
-                background: rgba(18,10,7,0.95); backdrop-filter: blur(14px);
-                padding: 0; border-radius: 14px; z-index: 1000001;
-                min-width: 340px; max-width: 92vw; max-height: 88vh; overflow-y: auto;
-                box-shadow: 0 10px 30px rgba(0,0,0,0.55);
-                border: 1px solid rgba(255,140,60,0.28);
-                font-family: 'Segoe UI', sans-serif; color: #fff;
-            }
-            #bc-panel-header {
-                display: flex; align-items: center; justify-content: space-between;
-                padding: 12px 14px; cursor: move; user-select: none;
-                background: linear-gradient(135deg, rgba(255,120,40,0.18), rgba(0,0,0,0));
-                border-bottom: 1px solid rgba(255,140,60,0.2);
-                border-radius: 14px 14px 0 0;
-            }
-            #bc-panel-header .bc-title { font-weight: 700; font-size: 14px; letter-spacing: 0.3px; }
-            #bc-panel-header .bc-close-x {
-                cursor: pointer; width: 22px; height: 22px; border-radius: 50%;
-                display: flex; align-items: center; justify-content: center;
-                background: rgba(255,255,255,0.08); font-size: 14px; line-height: 1;
-            }
-            #bc-panel-header .bc-close-x:hover { background: rgba(255,80,60,0.4); }
-            #bc-panel-body { padding: 14px 16px 16px; }
-            #bc-panel .bc-status {
-                text-align:center; font-size: 12px; color: #ffb066; margin-bottom: 12px;
-                padding: 6px; background: rgba(255,140,60,0.08); border-radius: 8px;
-            }
-            #bc-panel .bc-section-title {
-                font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
-                color: #ff9a5a; font-weight: 700; margin: 14px 0 6px;
-                border-bottom: 1px solid rgba(255,140,60,0.15); padding-bottom: 4px;
-            }
-            #bc-panel .bc-section-title:first-of-type { margin-top: 0; }
-            #bc-panel label { display: block; font-size: 11.5px; color: #e0b0a0; margin: 8px 0 3px; }
-            #bc-panel input[type="range"] {
-                width: 100%; accent-color: #ff7a30; height: 4px;
-            }
-            #bc-panel .bc-val { float: right; color: #ff9a5a; font-family: monospace; font-weight: 600; }
-            #bc-panel .bc-row { display: flex; gap: 8px; margin-top: 4px; }
-            #bc-panel button {
-                flex: 1; padding: 8px 0; border: none; border-radius: 7px;
-                font-weight: 600; cursor: pointer; font-size: 12.5px;
-                transition: filter 0.15s;
-            }
-            #bc-panel button:hover { filter: brightness(1.15); }
-            #bc-panel .bc-mode-btn { background: linear-gradient(135deg,#c04a1f,#5a1f0f); color: #fff; }
-            #bc-panel .bc-reset-btn { background: rgba(255,255,255,0.08); color: #ddd; margin-top: 10px; }
-        `;
-        document.head.appendChild(style);
-    }
-
-    function modeLabel() {
-        return SETTINGS.mode === "realistic" ? "Realistic 💀" : "Default 🔥";
-    }
-
-    function clampToViewport(left, top, w, h) {
-        const maxLeft = window.innerWidth - w;
-        const maxTop = window.innerHeight - h;
-        return {
-            left: Math.min(Math.max(left, 0), Math.max(maxLeft, 0)),
-            top: Math.min(Math.max(top, 0), Math.max(maxTop, 0))
-        };
-    }
-
-    function attachDragHandlers(header) {
-        header.addEventListener("mousedown", (e) => {
-            if (e.target.closest(".bc-close-x")) return;
-            isDragging = true;
-            const rect = panel.getBoundingClientRect();
-            dragStartX = e.clientX;
-            dragStartY = e.clientY;
-            dragOriginLeft = rect.left;
-            dragOriginTop = rect.top;
-            panel.style.transform = "none";
-            panel.style.left = rect.left + "px";
-            panel.style.top = rect.top + "px";
-            e.preventDefault();
-        });
-
-        window.addEventListener("mousemove", (e) => {
-            if (!isDragging) return;
-            const dx = e.clientX - dragStartX;
-            const dy = e.clientY - dragStartY;
-            const rect = panel.getBoundingClientRect();
-            const clamped = clampToViewport(dragOriginLeft + dx, dragOriginTop + dy, rect.width, rect.height);
-            panel.style.left = clamped.left + "px";
-            panel.style.top = clamped.top + "px";
-            panelPos = clamped;
-        });
-
-        window.addEventListener("mouseup", () => { isDragging = false; });
-    }
-
-    function showPanel() {
-        if (panel) { panel.remove(); panel = null; return; }
-
-        buildPanelStyles();
-
-        panel = document.createElement("div");
-        panel.id = "bc-panel";
-        panel.innerHTML = `
-            <div id="bc-panel-header">
-                <span class="bc-title">💥 Better Crashes</span>
-                <span class="bc-close-x" id="bc-close-x">✕</span>
-            </div>
-            <div id="bc-panel-body">
-                <div class="bc-status" id="bc-status">Current mode: ${modeLabel()}</div>
-
-                <div class="bc-section-title">General</div>
-                <div class="bc-row">
-                    <button class="bc-mode-btn" id="bc-mode-btn">Switch to ${SETTINGS.mode === "realistic" ? "Default" : "Realistic"}</button>
-                </div>
-
-                <div class="bc-section-title">Visual</div>
-                <label>Flash duration - Default (ms) <span class="bc-val" id="bc-dflash-val">${SETTINGS.defaultFlashMs}</span></label>
-                <input type="range" id="bc-dflash" min="20" max="300" step="10" value="${SETTINGS.defaultFlashMs}">
-
-                <label>Flash duration - Realistic (ms) <span class="bc-val" id="bc-rflash-val">${SETTINGS.realisticFlashMs}</span></label>
-                <input type="range" id="bc-rflash" min="5" max="100" step="1" value="${SETTINGS.realisticFlashMs}">
-
-                <label>Camera shake intensity (px) <span class="bc-val" id="bc-shake-val">${SETTINGS.shakeIntensity}</span></label>
-                <input type="range" id="bc-shake" min="0" max="90" step="5" value="${SETTINGS.shakeIntensity}">
-
-                <label>Debris count <span class="bc-val" id="bc-debris-val">${SETTINGS.debrisCount}</span></label>
-                <input type="range" id="bc-debris" min="10" max="200" step="10" value="${SETTINGS.debrisCount}">
-
-                <label>Fire tint duration - Default (s) <span class="bc-val" id="bc-tint-val">${(SETTINGS.fireTintDurationMs / 1000).toFixed(0)}</span></label>
-                <input type="range" id="bc-tint" min="1" max="15" step="1" value="${SETTINGS.fireTintDurationMs / 1000}">
-
-                <div class="bc-section-title">Realistic Mode</div>
-                <label>Cut-to-black duration (ms) <span class="bc-val" id="bc-cut-val">${SETTINGS.realisticCutMs}</span></label>
-                <input type="range" id="bc-cut" min="100" max="500" step="5" value="${SETTINGS.realisticCutMs}">
-
-                <div class="bc-section-title">Audio</div>
-                <label>Explosion volume <span class="bc-val" id="bc-vol-val">${SETTINGS.explosionVolume}</span></label>
-                <input type="range" id="bc-vol" min="0" max="10" step="0.5" value="${SETTINGS.explosionVolume}">
-
-                <button class="bc-reset-btn" id="bc-reset-btn">↺ Restore defaults</button>
-            </div>
-        `;
-        document.body.appendChild(panel);
-
-        if (panelPos) {
-            panel.style.transform = "none";
-            panel.style.left = panelPos.left + "px";
-            panel.style.top = panelPos.top + "px";
-        }
-
-        const statusEl = panel.querySelector("#bc-status");
-        const modeBtn = panel.querySelector("#bc-mode-btn");
-
-        modeBtn.onclick = function () {
-            SETTINGS.mode = SETTINGS.mode === "realistic" ? "default" : "realistic";
-            syncRealisticModeClass();
-            statusEl.textContent = `Current mode: ${modeLabel()}`;
-            modeBtn.textContent = `Switch to ${SETTINGS.mode === "realistic" ? "Default" : "Realistic"}`;
-            saveSettings();
-            console.log(`💥 [Better Crashes] Mode changed to: ${SETTINGS.mode}`);
-        };
-
-        panel.querySelector("#bc-dflash").oninput = function () {
-            SETTINGS.defaultFlashMs = parseFloat(this.value);
-            panel.querySelector("#bc-dflash-val").textContent = this.value;
-            saveSettings();
-        };
-        panel.querySelector("#bc-rflash").oninput = function () {
-            SETTINGS.realisticFlashMs = parseFloat(this.value);
-            panel.querySelector("#bc-rflash-val").textContent = this.value;
-            saveSettings();
-        };
-        panel.querySelector("#bc-shake").oninput = function () {
-            SETTINGS.shakeIntensity = parseFloat(this.value);
-            panel.querySelector("#bc-shake-val").textContent = this.value;
-            saveSettings();
-        };
-        panel.querySelector("#bc-debris").oninput = function () {
-            SETTINGS.debrisCount = parseFloat(this.value);
-            panel.querySelector("#bc-debris-val").textContent = this.value;
-            saveSettings();
-        };
-        panel.querySelector("#bc-tint").oninput = function () {
-            SETTINGS.fireTintDurationMs = parseFloat(this.value) * 1000;
-            panel.querySelector("#bc-tint-val").textContent = this.value;
-            saveSettings();
-        };
-        panel.querySelector("#bc-cut").oninput = function () {
-            SETTINGS.realisticCutMs = parseFloat(this.value);
-            panel.querySelector("#bc-cut-val").textContent = this.value;
-            saveSettings();
-        };
-        panel.querySelector("#bc-vol").oninput = function () {
-            SETTINGS.explosionVolume = parseFloat(this.value);
-            explosionGain.gain.value = SETTINGS.explosionVolume;
-            panel.querySelector("#bc-vol-val").textContent = this.value;
-            saveSettings();
-        };
-
-        panel.querySelector("#bc-reset-btn").onclick = function () {
-            Object.assign(SETTINGS, DEFAULTS);
-            explosionGain.gain.value = SETTINGS.explosionVolume;
-            syncRealisticModeClass();
-            saveSettings(); // persist the reset-to-defaults too, so a reload doesn't bring old values back
-            console.log("↺ [Better Crashes] Values restored to defaults.");
-            panel.remove();
-            panel = null;
-            showPanel();
-        };
-
-        panel.querySelector("#bc-close-x").onclick = function () {
-            panel.remove();
-            panel = null;
-        };
-
-        attachDragHandlers(panel.querySelector("#bc-panel-header"));
-    }
-
-    document.addEventListener(
-        "keydown",
-        (e) => {
-            const tag = document.activeElement?.tagName;
-            if (e.key === "Escape" && panel) { panel.remove(); panel = null; return; }
-            if (e.altKey && e.key.toLowerCase() === "n" && !e.ctrlKey && !e.shiftKey && !["INPUT", "TEXTAREA"].includes(tag)) {
-                e.preventDefault();
-                e.stopPropagation();
-                showPanel();
-            }
-        },
-        true
+    const carto = new Cesium.Cartographic(
+      Cesium.Math.toRadians(sampleLon),
+      Cesium.Math.toRadians(sampleLat)
     );
 
-    // ============================================================
-    // CRASH DETECTION
-    // ============================================================
-    function isCrashed() {
-        try { return !!unsafeWindow?.geofs?.aircraft?.instance?.crashed; } catch (e) { return false; }
-    }
-    function isCrashedFallback() {
-        try { return !!window.geofs?.aircraft?.instance?.crashed; } catch (e) { return false; }
-    }
-
-    function getSpeedKnots() {
-        try {
-            const win = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
-            const tas = win?.geofs?.aircraft?.instance?.trueAirSpeed;
-            if (typeof tas !== "number" || !isFinite(tas)) return null;
-            return tas * 1.94384;
-        } catch (e) { return null; }
+    let renderedHeight = null;
+    try {
+      if (canHide) obj3d.setVisibility(false);
+      renderedHeight = viewer.scene.sampleHeight(carto);
+    } catch (e) {
+      renderedHeight = null;
+    } finally {
+      if (canHide) obj3d.setVisibility(true);
     }
 
-    const REFERENCE_SPEED_KNOTS = 220;
-    const MIN_SPEED_FACTOR = 0.35;
-    const MAX_SPEED_FACTOR = 2.2;
+    if (renderedHeight == null) return null;
+    return { renderedHeight, sampleLat, sampleLon };
+  }
 
-    function speedToVolumeFactor(speedKnots) {
-        if (speedKnots == null) return 1;
-        const raw = speedKnots / REFERENCE_SPEED_KNOTS;
-        return Math.min(MAX_SPEED_FACTOR, Math.max(MIN_SPEED_FACTOR, raw));
+  async function hasBuildingAtExactPosition(viewer, lat, lon, headingDeg, altM) {
+    const Cesium = getCesium();
+    if (!Cesium || !viewer) return false;
+
+    const sampled = sampleHeightAtAircraft(viewer, lat, lon, headingDeg);
+    if (!sampled) return false;
+    const { renderedHeight, sampleLat, sampleLon } = sampled;
+
+    const latRad = Cesium.Math.toRadians(sampleLat);
+    const lonRad = Cesium.Math.toRadians(sampleLon);
+    const carto = new Cesium.Cartographic(lonRad, latRad);
+
+    let terrainHeight;
+    try {
+      terrainHeight = viewer.scene.globe.getHeight(carto);
+    } catch (e) {
+      return false;
+    }
+    if (terrainHeight == null || !Number.isFinite(terrainHeight)) return false;
+
+    const diff = renderedHeight - terrainHeight;
+    const hasTallObject = diff >= settings.objectHeightThresholdM;
+
+    let clearance = null;
+    let withinVerticalRange = true;
+    if (typeof altM === "number" && Number.isFinite(altM)) {
+      clearance = altM - renderedHeight;
+      withinVerticalRange = clearance <= settings.buildingVerticalMarginM;
     }
 
-    setInterval(() => {
-        const speed = getSpeedKnots();
-        if (speed != null) lastSpeedKnots = speed;
+    const isHit = hasTallObject && withinVerticalRange;
 
-        const crashed = typeof unsafeWindow !== "undefined" ? isCrashed() : isCrashedFallback();
+    if (hasTallObject && settings.debugLogs) {
+      console.log(
+        `[Real Impact][DEBUG] raw building hit -- lat=${sampleLat.toFixed(6)} lon=${sampleLon.toFixed(6)} ` +
+        `renderedHeight=${renderedHeight.toFixed(2)}m terrainHeight=${terrainHeight.toFixed(2)}m diff=${diff.toFixed(2)}m ` +
+        `(threshold=${settings.objectHeightThresholdM}m) altM=${altM != null ? altM.toFixed(2) : "n/a"} ` +
+        `clearance=${clearance != null ? clearance.toFixed(2) + "m" : "n/a"} ` +
+        `(margin=${settings.buildingVerticalMarginM}m) -> ${isHit ? "CONFIRMED" : "too high above it, ignored"}`
+      );
+    }
 
-        if (crashed && !wasCrashed) {
-            wasCrashed = true;
-            const factor = speedToVolumeFactor(lastSpeedKnots);
-            speedGain.gain.value = factor;
-            console.log(`💥 [Better Crashes] Speed: ${lastSpeedKnots.toFixed(1)} kt | Volume factor: ${factor.toFixed(2)}x`);
-            triggerBetterCrash();
-        } else if (!crashed && wasCrashed) {
-            wasCrashed = false;
-            stopFireTint();
-            hideBlackout();
-            restorePageAudio();
-        } else if (!crashed) {
-            wasCrashed = false;
+    return isHit;
+  }
+
+  // FIX v3.4.1: Passes settings.treeCanopyHeightM to the cylinder-aware isTreeNear/findNearestTree,
+  // with STRICT universal altitude ceiling enforcement (never trigger if altFt > minAltitudeFt).
+  function hasTreeAtExactPosition(lat, lon, heightM, speedKts, altFt) {
+    if (typeof window.geofsRealTrees?.isTreeNear !== "function") return false;
+
+    // HARD UNIVERSAL CEILING: If the aircraft AGL altitude exceeds the configured threshold,
+    // it is mathematically impossible to hit a tree under any edge case.
+    if (typeof altFt === "number" && altFt > settings.minAltitudeFt) {
+      return false;
+    }
+
+    // Synchronize vertical canopy collision height: canopy collision height in meters
+    // is strictly capped by the user-configured altitude gate (converted from feet to meters).
+    const maxCanopyFromAltM = settings.minAltitudeFt * 0.3048;
+    const effectiveCanopyM = Math.min(settings.treeCanopyHeightM, maxCanopyFromAltM);
+
+    const hit = window.geofsRealTrees.isTreeNear(lat, lon, settings.treeRadiusM, heightM, effectiveCanopyM);
+    if (hit && settings.debugLogs) {
+      let matchInfo = "";
+      if (typeof window.geofsRealTrees?.findNearestTree === "function") {
+        const match = window.geofsRealTrees.findNearestTree(lat, lon, settings.treeRadiusM, heightM, effectiveCanopyM);
+        if (match) {
+          const horizStr = match.horizDistance != null ? ` horizDist=${match.horizDistance.toFixed(2)}m,` : "";
+          const relHStr = match.relHeight != null ? ` relHeight=${match.relHeight.toFixed(2)}m (canopy ${match.canopyHeight || effectiveCanopyM.toFixed(1)}m),` : "";
+          matchInfo = ` matchedTree{lat=${match.lat.toFixed(6)}, lon=${match.lon.toFixed(6)}, ` +
+            `baseAlt=${match.height.toFixed(2)}m,${horizStr}${relHStr} 3dDist=${match.distance.toFixed(2)}m, tile=${match.tileId}}`;
         }
-    }, 200);
+      }
+      console.log(
+        `[Real Impact][DEBUG] 💥 cylinder tree hit -- lat=${lat.toFixed(6)} lon=${lon.toFixed(6)} ` +
+        `altM=${typeof heightM === "number" ? heightM.toFixed(2) : "n/a"} haglFt=${typeof altFt === "number" ? altFt.toFixed(1) : "n/a"} ` +
+        `radius=${settings.treeRadiusM}m canopy=${effectiveCanopyM.toFixed(1)}m ` +
+        `speed=${typeof speedKts === "number" ? speedKts.toFixed(1) + "kt" : "n/a"}${matchInfo}`
+      );
+    }
+    return hit;
+  }
+
+  // ============================================================
+  // 3. Forced fall mode
+  // ============================================================
+  function hookControlsForForcedFall() {
+    if (controlsHooked || typeof window.controls === "undefined") return;
+    controlsHooked = true;
+
+    const originalUpdate = window.controls.update.bind(window.controls);
+    window.controls.update = function (...args) {
+      const result = originalUpdate(...args);
+      if (forceFallActive) {
+        forceFallElapsed += 1 / 60;
+        const intensity = Math.min(1, forceFallElapsed / 2);
+        window.controls.throttle = 0;
+        window.controls.pitch = (Math.random() * 2 - 1) * 0.6 * intensity;
+        window.controls.roll = (Math.random() * 2 - 1) * 0.9 * intensity;
+        window.controls.yaw = (Math.random() * 2 - 1) * 0.5 * intensity;
+        const instance = window.geofs?.aircraft?.instance;
+        if (instance?.engine) instance.engine.on = false;
+      }
+      return result;
+    };
+  }
+
+  function startForcedFall() {
+    forceFallActive = true;
+    forceFallElapsed = 0;
+  }
+
+  function stopForcedFall() {
+    forceFallActive = false;
+    forceFallElapsed = 0;
+  }
+
+  function hookResetFlight() {
+    if (resetFlightHooked || typeof window.geofs?.resetFlight !== "function") return;
+    resetFlightHooked = true;
+    const originalReset = window.geofs.resetFlight.bind(window.geofs);
+    window.geofs.resetFlight = function (...args) {
+      stopForcedFall();
+      lastCrashTime = 0;
+      return originalReset(...args);
+    };
+  }
+
+  // ============================================================
+  // 4. Main loop
+  // ============================================================
+  let checkInFlight = false;
+  let consecutiveBuildingHits = 0;
+
+  async function mainLoop() {
+    if (!settings.enabled) return;
+    const instance = window.geofs?.aircraft?.instance;
+    const values = window.geofs?.animation?.values;
+    const viewer = getViewer();
+    if (!instance || !values || !viewer) return;
+
+    const currentCrashed = !!instance.crashed;
+    if (lastCrashedState && !currentCrashed) {
+      spawnGraceUntil = performance.now() + settings.spawnGraceMs;
+      stopForcedFall();
+      consecutiveBuildingHits = 0;
+    }
+    lastCrashedState = currentCrashed;
+
+    if (performance.now() < spawnGraceUntil) return;
+    if (forceFallActive) return;
+    if (checkInFlight) return;
+
+    const now = performance.now();
+    if (now - lastCrashTime < settings.cooldownMs) return;
+
+    const altFt = values.haglFeet;
+    const speedKts = values.kias || 0;
+    if (altFt == null) return;
+    if (speedKts < settings.minSpeedKts) return;
+
+    const treesArmed = altFt <= settings.minAltitudeFt;
+    const buildingsArmed = altFt <= settings.buildingMaxAltitudeFt;
+
+    // FIX v3.4.1: Strictly isolate tree checks to treesArmed.
+    // Never allow building altitude checks to accidentally keep tree collision active at high altitudes!
+    const treeCheckArmed = treesArmed;
+    if (!buildingsArmed) consecutiveBuildingHits = 0;
+    if (!treeCheckArmed && !buildingsArmed) return;
+
+    const lla = instance.lastLlaLocation;
+    if (!lla) return;
+    const [lat, lon, altM] = lla;
+    const headingDeg = values.heading || 0;
+
+    checkInFlight = true;
+    try {
+      let hit = false;
+
+      if (treeCheckArmed && hasTreeAtExactPosition(lat, lon, altM, speedKts, altFt)) {
+        hit = true;
+      }
+
+      if (!hit && buildingsArmed && settings.buildingsEnabled) {
+        const buildingHit = await hasBuildingAtExactPosition(viewer, lat, lon, headingDeg, altM);
+        consecutiveBuildingHits = buildingHit ? consecutiveBuildingHits + 1 : 0;
+        hit = consecutiveBuildingHits >= settings.buildingConfirmChecks;
+      }
+
+      if (hit) {
+        consecutiveBuildingHits = 0;
+        lastCrashTime = performance.now();
+        instance.crash();
+        hookControlsForForcedFall();
+        startForcedFall();
+        showToast("💥 Impact against a real obstacle detected", true);
+        const altStr = typeof altFt === "number" ? `${altFt.toFixed(0)}ft AGL` : "n/a";
+        const spdStr = typeof speedKts === "number" ? `${speedKts.toFixed(0)}kt` : "n/a";
+        console.log(
+          `%c[Real Impact]%c 💥 FORCED CRASH -- obstacle confirmed at lat=${lat.toFixed(5)}, lon=${lon.toFixed(5)} (${altStr}, ${spdStr})`,
+          "color:#ef4444;font-weight:bold;",
+          "color:#fca5a5;"
+        );
+      }
+    } finally {
+      checkInFlight = false;
+    }
+  }
+
+  // ============================================================
+  // 5. Console Panel (] key)
+  // ============================================================
+  function showPanel() {
+    if (panel) { panel.remove(); panel = null; return; }
+
+    const style = document.createElement("style");
+    style.textContent = `
+      #cur-panel {
+        position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+        background: rgba(20,10,10,0.92); backdrop-filter: blur(12px);
+        padding: 18px; border-radius: 14px; z-index: 100000;
+        min-width: 320px; box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+        border: 1px solid rgba(255,80,80,0.25);
+        font-family: 'Segoe UI', sans-serif; color: #fff;
+      }
+      #cur-panel .title { font-weight: bold; font-size: 15px; margin-bottom: 10px; text-align: center; }
+      #cur-panel label { display: block; font-size: 11px; color: #e0a0a0; margin: 8px 0 2px; }
+      #cur-panel input[type="range"] { width: 100%; }
+      #cur-panel .val { float: right; color: #ff8a8a; font-family: monospace; }
+      #cur-panel button {
+        width: 100%; margin-top: 8px; padding: 6px 0; border: none; border-radius: 6px;
+        font-weight: 600; cursor: pointer;
+      }
+      #cur-panel .toggle-btn { background: linear-gradient(135deg,#a01f1f,#5a0f0f); color: #fff; }
+      #cur-panel .reset-btn { background: rgba(255,255,255,0.1); color: #ddd; }
+      #cur-panel .defaults-btn { background: rgba(255,255,255,0.1); color: #ddd; }
+      #cur-panel .status-line {
+        margin-top: 10px; padding: 6px 8px; background: rgba(0,0,0,0.25);
+        border-radius: 6px; font-size: 11px; color: #cabfbf;
+      }
+    `;
+    document.head.appendChild(style);
+
+    panel = document.createElement("div");
+    panel.id = "cur-panel";
+    const treesStatus = typeof window.geofsRealTrees?.isTreeNear === "function"
+      ? "✅ Tree extractor connected (Cylinder Mode)"
+      : "⚠️ Tree extractor NOT detected (only buildings are active)";
+    panel.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; border-bottom:1px solid rgba(255,255,255,0.1); padding-bottom:8px;">
+        <div class="title" style="margin:0; text-align:left; font-size:15px;">💥 GeoFS Real Impact v3.4.2</div>
+        <button id="cur-close-x" style="width:26px; height:26px; margin:0; padding:0; line-height:24px; background:rgba(255,255,255,0.12); hover:bg:rgba(255,255,255,0.25); border:1px solid rgba(255,255,255,0.25); border-radius:6px; color:#fff; font-size:15px; cursor:pointer; font-weight:bold; display:flex; align-items:center; justify-content:center;" title="Cerrar panel (] o clic)">✕</button>
+      </div>
+      <label>Max tree impact gate (ft, above ground) <span class="val" id="cur-a-val">${settings.minAltitudeFt}</span></label>
+      <input type="range" id="cur-alt" min="15" max="300" step="5" value="${settings.minAltitudeFt}">
+      <label>Max building impact gate (ft, above ground) <span class="val" id="cur-b-val">${settings.buildingMaxAltitudeFt}</span></label>
+      <input type="range" id="cur-balt" min="200" max="3500" step="50" value="${settings.buildingMaxAltitudeFt}">
+      <label>Min speed to arm crash check (kts) <span class="val" id="cur-s-val">${settings.minSpeedKts}</span></label>
+      <input type="range" id="cur-speed" min="0" max="60" step="1" value="${settings.minSpeedKts}">
+      <label>Tree canopy collision height (m) <span class="val" id="cur-th-val">${settings.treeCanopyHeightM}</span></label>
+      <input type="range" id="cur-treeheight" min="10" max="50" step="1" value="${settings.treeCanopyHeightM}">
+      <label>Tree horizontal radius (m) <span class="val" id="cur-t-val">${settings.treeRadiusM}</span></label>
+      <input type="range" id="cur-tree" min="2" max="20" step="0.5" value="${settings.treeRadiusM}">
+      <label>Building height threshold (m) <span class="val" id="cur-h-val">${settings.objectHeightThresholdM}</span></label>
+      <input type="range" id="cur-height" min="0.5" max="10" step="0.5" value="${settings.objectHeightThresholdM}">
+      <label>Building vertical clearance margin (m) <span class="val" id="cur-v-val">${settings.buildingVerticalMarginM}</span></label>
+      <input type="range" id="cur-vmargin" min="1" max="30" step="1" value="${settings.buildingVerticalMarginM}">
+      <label>Building confirmation passes <span class="val" id="cur-c-val">${settings.buildingConfirmChecks}</span></label>
+      <input type="range" id="cur-confirm" min="1" max="5" step="1" value="${settings.buildingConfirmChecks}">
+      <button class="toggle-btn" id="cur-toggle">${settings.enabled ? "Disable" : "Enable"}</button>
+      <button class="reset-btn" id="cur-bldg-toggle">${settings.buildingsEnabled ? "Disable buildings only" : "Enable buildings only"}</button>
+      <button class="reset-btn" id="cur-debug-toggle">Console: ${settings.debugLogs ? "Verbose (Debug)" : "Quiet (Clean)"}</button>
+      <button class="reset-btn" id="cur-reset">Force end of fall mode (debug)</button>
+      <button class="defaults-btn" id="cur-defaults">↺ Restore default values</button>
+      <button id="cur-close-bottom" style="background:#2d1515; color:#ff9999; border:1px solid rgba(255,80,80,0.35); font-size:12px; margin-top:10px;">✕ Cerrar Panel (o tecla ])</button>
+      <div class="status-line">${treesStatus}</div>
+    `;
+    document.body.appendChild(panel);
+
+    panel.querySelector("#cur-debug-toggle").onclick = function () {
+      settings.debugLogs = !settings.debugLogs;
+      this.textContent = `Console: ${settings.debugLogs ? "Verbose (Debug)" : "Quiet (Clean)"}`;
+      saveSettings();
+    };
+
+    panel.querySelector("#cur-alt").oninput = function () {
+      settings.minAltitudeFt = parseFloat(this.value);
+      panel.querySelector("#cur-a-val").textContent = this.value;
+      saveSettings();
+    };
+    panel.querySelector("#cur-balt").oninput = function () {
+      settings.buildingMaxAltitudeFt = parseFloat(this.value);
+      panel.querySelector("#cur-b-val").textContent = this.value;
+      saveSettings();
+    };
+    panel.querySelector("#cur-speed").oninput = function () {
+      settings.minSpeedKts = parseFloat(this.value);
+      panel.querySelector("#cur-s-val").textContent = this.value;
+      saveSettings();
+    };
+    panel.querySelector("#cur-treeheight").oninput = function () {
+      settings.treeCanopyHeightM = parseFloat(this.value);
+      panel.querySelector("#cur-th-val").textContent = this.value;
+      saveSettings();
+    };
+    panel.querySelector("#cur-tree").oninput = function () {
+      settings.treeRadiusM = parseFloat(this.value);
+      panel.querySelector("#cur-t-val").textContent = this.value;
+      saveSettings();
+    };
+    panel.querySelector("#cur-height").oninput = function () {
+      settings.objectHeightThresholdM = parseFloat(this.value);
+      panel.querySelector("#cur-h-val").textContent = this.value;
+      saveSettings();
+    };
+    panel.querySelector("#cur-vmargin").oninput = function () {
+      settings.buildingVerticalMarginM = parseFloat(this.value);
+      panel.querySelector("#cur-v-val").textContent = this.value;
+      saveSettings();
+    };
+    panel.querySelector("#cur-confirm").oninput = function () {
+      settings.buildingConfirmChecks = parseFloat(this.value);
+      panel.querySelector("#cur-c-val").textContent = this.value;
+      saveSettings();
+    };
+    panel.querySelector("#cur-toggle").onclick = function () {
+      settings.enabled = !settings.enabled;
+      this.textContent = settings.enabled ? "Disable" : "Enable";
+      saveSettings();
+    };
+    panel.querySelector("#cur-bldg-toggle").onclick = function () {
+      settings.buildingsEnabled = !settings.buildingsEnabled;
+      this.textContent = settings.buildingsEnabled ? "Disable buildings only" : "Enable buildings only";
+      saveSettings();
+    };
+    panel.querySelector("#cur-reset").onclick = stopForcedFall;
+    panel.querySelector("#cur-defaults").onclick = function () {
+      Object.assign(settings, DEFAULTS);
+      saveSettings();
+      panel.remove();
+      panel = null;
+      showPanel();
+    };
+    function closePanel() {
+      if (panel) {
+        panel.remove();
+        panel = null;
+      }
+    }
+    panel.querySelector("#cur-close-x").onclick = closePanel;
+    panel.querySelector("#cur-close-bottom").onclick = closePanel;
+  }
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "]" && !["INPUT", "TEXTAREA"].includes(document.activeElement?.tagName)) {
+      e.preventDefault();
+      showPanel();
+    }
+  });
+
+  window.realImpact = {
+    settings,
+    setDebug: (enabled) => {
+      settings.debugLogs = !!enabled;
+      saveSettings();
+      console.log(`[Real Impact] Debug logs: ${settings.debugLogs ? "ON (verbose)" : "OFF (quiet)"}`);
+    },
+    stopForcedFall,
+    showPanel
+  };
+
+  // ============================================================
+  // 6. Initialization
+  // ============================================================
+  function tryInit() {
+    if (injected) return;
+    if (!window.geofs?.aircraft?.instance || typeof window.controls === "undefined") return;
+    injected = true;
+
+    if (window.geofs.preferences && !geofs.preferences.crashDetection) {
+      geofs.preferences.crashDetection = true;
+    }
+    hookControlsForForcedFall();
+    hookResetFlight();
+
+    setInterval(mainLoop, 200);
+    const treesReady = typeof window.geofsRealTrees?.isTreeNear === "function";
+    console.log(
+      `%c[Real Impact]%c 💥 v3.4.2 ready · Trees: ${treesReady ? "CYLINDER (gate: " + settings.minAltitudeFt + "ft, canopy: " + settings.treeCanopyHeightM + "m)" : "NOT detected"} · Press ] for Settings`,
+      "color:#f43f5e;font-weight:bold;",
+      "color:#94a3b8;"
+    );
+  }
+
+  let attempts = 0;
+  const poller = setInterval(() => {
+    tryInit();
+    if (injected || ++attempts > 120) clearInterval(poller);
+  }, 300);
+  window.addEventListener("load", tryInit);
 })();
